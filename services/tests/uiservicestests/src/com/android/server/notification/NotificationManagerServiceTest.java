@@ -46,8 +46,11 @@ import static android.os.Build.VERSION_CODES.O_MR1;
 import static android.os.Build.VERSION_CODES.P;
 import static android.service.notification.Adjustment.KEY_IMPORTANCE;
 import static android.service.notification.Adjustment.KEY_USER_SENTIMENT;
+import static android.service.notification.NotificationListenerService.REASON_CANCEL_ALL;
 import static android.service.notification.NotificationListenerService.Ranking.USER_SENTIMENT_NEGATIVE;
 import static android.service.notification.NotificationListenerService.Ranking.USER_SENTIMENT_NEUTRAL;
+
+import static com.android.internal.widget.LockPatternUtils.StrongAuthTracker.STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN;
 
 import static junit.framework.Assert.assertEquals;
 import static junit.framework.Assert.assertFalse;
@@ -322,7 +325,25 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
             // Tests for this not being true are in CTS NotificationManagerTest
             return true;
         }
+
+        class StrongAuthTrackerFake extends NotificationManagerService.StrongAuthTracker {
+            private int mGetStrongAuthForUserReturnValue = 0;
+            StrongAuthTrackerFake(Context context) {
+                super(context);
+            }
+
+            public void setGetStrongAuthForUserReturnValue(int val) {
+                mGetStrongAuthForUserReturnValue = val;
+            }
+
+            @Override
+            public int getStrongAuthForUser(int userId) {
+                return mGetStrongAuthForUserReturnValue;
+            }
+        }
     }
+
+    TestableNotificationManagerService.StrongAuthTrackerFake mStrongAuthTracker;
 
     private class TestableToastCallback extends ITransientNotification.Stub {
         @Override
@@ -373,6 +394,7 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         when(mPackageManager.getPackagesForUid(mUid)).thenReturn(new String[]{PKG});
         when(mPackageManagerClient.getPackagesForUid(anyInt())).thenReturn(new String[]{PKG});
         mContext.addMockSystemService(AppOpsManager.class, mock(AppOpsManager.class));
+        when(mUm.getProfileIds(0, false)).thenReturn(new int[]{0});
 
         // write to a test file; the system file isn't readable from tests
         mFile = new File(mContext.getCacheDir(), "test.xml");
@@ -410,6 +432,9 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         mService.onBootPhase(SystemService.PHASE_SYSTEM_SERVICES_READY);
 
         mService.setAudioManager(mAudioManager);
+
+        mStrongAuthTracker = mService.new StrongAuthTrackerFake(mContext);
+        mService.setStrongAuthTracker(mStrongAuthTracker);
 
         // Tests call directly into the Binder.
         mBinderService = mService.getBinderService();
@@ -483,6 +508,18 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
     private NotificationRecord generateNotificationRecord(NotificationChannel channel,
             Notification.TvExtender extender) {
         return generateNotificationRecord(channel, extender, false /* isBubble */);
+    }
+
+    private NotificationRecord generateNotificationRecord(NotificationChannel channel, int userId) {
+        if (channel == null) {
+            channel = mTestNotificationChannel;
+        }
+        Notification.Builder nb = new Notification.Builder(mContext, channel.getId())
+                .setContentTitle("foo")
+                .setSmallIcon(android.R.drawable.sym_def_app_icon);
+        StatusBarNotification sbn = new StatusBarNotification(PKG, PKG, 1, "tag", mUid, 0,
+                nb.build(), new UserHandle(userId), null, 0);
+        return new NotificationRecord(mContext, sbn, channel);
     }
 
     private NotificationRecord generateNotificationRecord(NotificationChannel channel,
@@ -5401,5 +5438,73 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
         // The bubble should still exist
         StatusBarNotification[] notifsAfter = mBinderService.getActiveNotifications(PKG);
         assertEquals(1, notifsAfter.length);
+    }
+
+    public void testGetActiveNotification_filtersUsers() throws Exception {
+        when(mUm.getProfileIds(0, false)).thenReturn(new int[]{0, 10});
+
+        NotificationRecord nr0 =
+                generateNotificationRecord(mTestNotificationChannel, 0);
+        mBinderService.enqueueNotificationWithTag(PKG, PKG, "tag0",
+                nr0.sbn.getId(), nr0.sbn.getNotification(), nr0.sbn.getUserId());
+
+        NotificationRecord nr10 =
+                generateNotificationRecord(mTestNotificationChannel, 10);
+        mBinderService.enqueueNotificationWithTag(PKG, PKG, "tag10",
+                nr10.sbn.getId(), nr10.sbn.getNotification(), nr10.sbn.getUserId());
+
+        NotificationRecord nr11 =
+                generateNotificationRecord(mTestNotificationChannel, 11);
+        mBinderService.enqueueNotificationWithTag(PKG, PKG, "tag11",
+                nr11.sbn.getId(), nr11.sbn.getNotification(), nr11.sbn.getUserId());
+        waitForIdle();
+
+        StatusBarNotification[] notifs = mBinderService.getActiveNotifications(PKG);
+        assertEquals(2, notifs.length);
+        for (StatusBarNotification sbn : notifs) {
+            if (sbn.getUserId() == 11) {
+                fail("leaked data across users");
+            }
+        }
+    }
+
+    @Test
+    public void testStrongAuthTracker_isInLockDownMode() {
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(
+                STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN);
+        mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
+        assertTrue(mStrongAuthTracker.isInLockDownMode());
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(0);
+        mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
+        assertFalse(mStrongAuthTracker.isInLockDownMode());
+    }
+
+    @Test
+    public void testCancelAndPostNotificationsWhenEnterAndExitLockDownMode() {
+        // post 2 notifications from 2 packages
+        NotificationRecord pkgA = new NotificationRecord(mContext,
+                generateSbn("a", 1000, 9, 0), mTestNotificationChannel);
+        mService.addNotification(pkgA);
+        NotificationRecord pkgB = new NotificationRecord(mContext,
+                generateSbn("b", 1001, 9, 0), mTestNotificationChannel);
+        mService.addNotification(pkgB);
+
+        // when entering the lockdown mode, cancel the 2 notifications.
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(
+                STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN);
+        mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
+        assertTrue(mStrongAuthTracker.isInLockDownMode());
+
+        // the notifyRemovedLocked function is called twice due to REASON_LOCKDOWN.
+        ArgumentCaptor<Integer> captor = ArgumentCaptor.forClass(Integer.class);
+        verify(mListeners, times(2)).notifyRemovedLocked(any(), captor.capture(), any());
+        assertEquals(REASON_CANCEL_ALL, captor.getValue().intValue());
+
+        // exit lockdown mode.
+        mStrongAuthTracker.setGetStrongAuthForUserReturnValue(0);
+        mStrongAuthTracker.onStrongAuthRequiredChanged(mContext.getUserId());
+
+        // the notifyPostedLocked function is called twice.
+        verify(mListeners, times(2)).notifyPostedLocked(any(), any());
     }
 }
